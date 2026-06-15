@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Hide & Seek — Bogong</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+html {
+  width:100%; height:100%;
+  overflow:hidden;
+  background:#0a0f0a;
+}
+body {
+  width:100%; height:100%;
+  overflow:hidden;
+  background:#0a0f0a;
+  touch-action:none;
+  -webkit-user-select:none;
+  user-select:none;
+  font-family:'Trebuchet MS',sans-serif;
+}
+#wrap {
+  position:fixed;
+  inset:0;
+  background:#0a0f0a;
+  overflow:hidden;
+  touch-action:none;
+}
+canvas {
+  position:absolute;
+  top:0; left:0;
+  /* JS ile boyutlandırılacak */
+}
+#jzone{display:none;}
+#jbase,#jthumb{
+  position:absolute;border-radius:50%;display:none;
+  pointer-events:none;transform:translate(-50%,-50%);
+  z-index:15;
+}
+#jbase{width:130px;height:130px;background:rgba(255,255,255,0.06);border:2px solid rgba(255,255,255,0.2);}
+#jthumb{width:56px;height:56px;background:rgba(255,255,255,0.28);border:2px solid rgba(255,255,255,0.55);}
+#hud-btns{
+  position:absolute;top:12px;right:12px;
+  display:none;gap:10px;z-index:30;flex-direction:row;
+}
+#btn-pause,#btn-quit{
+  width:56px;height:56px;border-radius:14px;
+  border:1.5px solid rgba(255,255,255,0.28);
+  background:rgba(15,25,15,0.92);color:#fff;font-size:22px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  touch-action:manipulation;
+  -webkit-tap-highlight-color:transparent;
+  user-select:none;-webkit-user-select:none;
+}
+#btn-pause:active,#btn-quit:active{background:rgba(80,80,80,0.7);}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gc"></canvas>
+  <canvas id="uc"></canvas>
+  <div id="jzone"></div>
+  <div id="jbase"></div>
+  <div id="jthumb"></div>
+  <div id="hud-btns">
+    <div id="btn-pause">⏸</div>
+    <div id="btn-quit">✕</div>
+  </div>
+</div>
+
+<script>
+'use strict';
+// ═══════════════════════════════════════════════════════
+// SAVE / SCORE SYSTEM
+// ═══════════════════════════════════════════════════════
+const Save = {
+  KEY: 'hs_save',
+  load() {
+    try { return JSON.parse(localStorage.getItem(this.KEY)) || this.def(); }
+    catch { return this.def(); }
+  },
+  def() { return { totalScore: 0, level: 1, wins: 0, plays: 0 }; },
+  save(data) { try { localStorage.setItem(this.KEY, JSON.stringify(data)); } catch {} },
+  get() { return this.load(); },
+  addScore(pts) {
+    const d = this.load();
+    d.totalScore += pts; d.plays++;
+    this.save(d); return d;
+  },
+  recordWin(pts) {
+    const d = this.load();
+    d.totalScore += pts; d.wins++; d.plays++;
+    d.level = 1 + Math.floor(d.wins / 2); // Her 2 galibiyet = 1 seviye
+    this.save(d); return d;
+  },
+  // Seviyeye göre zorluk parametreleri
+  difficulty(level) {
+    // level 1-2: Kolay, 3-4: Orta, 5-6: Zor, 7+: Uzman
+    const tier = Math.min(Math.floor((level - 1) / 2), 4);
+    return {
+      seekerSpeed:   [72, 88, 102, 118, 130][tier],
+      seekerChase:   [115, 130, 148, 165, 180][tier],
+      visionRange:   [165, 185, 205, 220, 240][tier],
+      visionSpread:  [0.55, 0.62, 0.70, 0.78, 0.85][tier], // Math.PI çarpanı
+      seekerCount:   [1, 1, 2, 2, 2][tier],
+      hiderCount:    [3, 3, 4, 4, 5][tier],
+      timeHider:     [65, 60, 55, 50, 45][tier],
+      timeSeeker:    [55, 50, 45, 40, 38][tier],
+      label:         ['😊 Kolay','🙂 Normal','😤 Zor','😰 Uzman','💀 Efsane'][tier],
+    };
+  },
+  // Seviyeye göre harita indeksi: 1-2→Office, 3+→Cornfield (döngüsel)
+  mapForLevel(level) {
+    return (level <= 2) ? 0 : 1;
+  }
+};
+
+// ═══════════════════════════════════════════════════════
+// MAPS — her map birden fazla hider & seeker spawn noktası
+// ═══════════════════════════════════════════════════════
+// 0=zemin, 1=duvar, 2=hider spawn, 3=seeker spawn, 4=coin
+const MAPS = [
+  { // Level 1 — Office
+    name:'Office', cols:20, rows:20, cs:40,
+    grid:[
+      [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+      [1,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,1],
+      [1,0,4,0,0,1,0,4,0,0,0,4,0,0,1,0,4,0,2,1],
+      [1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,1],
+      [1,0,1,1,0,0,0,1,1,1,0,1,1,0,0,0,1,1,0,1],
+      [1,2,1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1,0,1],
+      [1,0,1,0,4,0,0,0,0,1,0,1,0,4,0,0,0,1,0,1],
+      [1,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,1],
+      [1,0,0,0,0,0,1,0,4,0,0,4,0,0,1,0,0,0,2,1],
+      [1,1,0,1,1,0,1,0,0,0,0,0,0,0,1,0,1,1,0,1],
+      [1,0,0,0,1,0,0,0,0,2,0,0,0,0,0,0,1,0,0,1],
+      [1,1,0,1,1,0,1,0,0,0,0,0,0,0,1,0,1,1,0,1],
+      [1,3,0,0,0,0,1,0,4,0,0,4,0,0,1,0,0,0,0,1],
+      [1,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,1],
+      [1,0,1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1,0,1],
+      [1,3,1,0,4,0,0,0,0,1,0,1,0,4,0,0,0,1,0,1],
+      [1,0,1,1,0,0,0,1,1,1,0,1,1,0,0,0,1,1,0,1],
+      [1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,1],
+      [1,2,4,0,0,1,0,4,0,0,0,4,0,0,1,0,4,0,0,1],
+      [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    ]
+  },
+  { // Level 2 — Cornfield (daha fazla engel)
+    name:'Cornfield', cols:22, rows:22, cs:36,
+    grid:[
+      [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,4,0,0,0,0,0,4,0,0,0,0,4,0,0,0,0,0,0,0,0,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,0,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,2,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,1],
+      [1,3,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,4,0,0,0,0,4,0,0,4,0,0,0,0,0,0,0,0,4,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+      [1,3,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,1],
+      [1,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+      [1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,0,1],
+      [1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,1],
+      [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    ]
+  }
+];
+
+// ═══════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════
+const WALL=1, HSPAWN=2, SSPAWN=3, COIN=4;
+const MODE={ MENU:'menu', PLAYING:'playing', PAUSED:'paused', OVER:'over', WIN:'win' };
+const ROLE={ S:'seeker', H:'hider' };
+
+// ═══════════════════════════════════════════════════════
+// PATHFINDER — BFS grid navigation
+// ═══════════════════════════════════════════════════════
+class Pathfinder {
+  constructor(grid, cols, rows) {
+    this.grid = grid; this.cols = cols; this.rows = rows;
+  }
+
+  // Pixel koordinatından grid hücresine
+  toCell(x, cs) { return Math.floor(x / cs); }
+
+  // BFS — hücreden hücreye yol bul, sonuç: [{col,row},...] veya null
+  bfs(sc, sr, gc, gr) {
+    if (sc===gc && sr===gr) return [];
+    const visited = new Uint8Array(this.cols * this.rows);
+    const prev = new Int32Array(this.cols * this.rows).fill(-1);
+    const queue = [sr * this.cols + sc];
+    visited[sr * this.cols + sc] = 1;
+    const dirs = [[0,-1],[0,1],[-1,0],[1,0],[1,-1],[-1,-1],[1,1],[-1,1]];
+    while (queue.length) {
+      const idx = queue.shift();
+      const col = idx % this.cols, row = Math.floor(idx / this.cols);
+      if (col===gc && row===gr) {
+        // Reconstruct path
+        const path = [];
+        let cur = idx;
+        while (cur !== sr * this.cols + sc) {
+          path.unshift({ col: cur % this.cols, row: Math.floor(cur / this.cols) });
+          cur = prev[cur];
+        }
+        return path;
+      }
+      for (const [dc,dr] of dirs) {
+        const nc = col+dc, nr = row+dr;
+        if (nc<0||nr<0||nc>=this.cols||nr>=this.rows) continue;
+        if (this.grid[nr][nc] === WALL) continue;
+        // Diagonal: check both adjacent cells to avoid corner cutting
+        if (dc!==0 && dr!==0) {
+          if (this.grid[row][col+dc]===WALL || this.grid[row+dr][col]===WALL) continue;
+        }
+        const ni = nr * this.cols + nc;
+        if (!visited[ni]) { visited[ni]=1; prev[ni]=idx; queue.push(ni); }
+      }
+    }
+    return null; // No path
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// SEEKER AI — BFS patrol + chase
+// ═══════════════════════════════════════════════════════
+class SeekerAI {
+  constructor(entity, pf, diff) {
+    this.e = entity; this.pf = pf;
+    this.diff = diff || { seekerSpeed:72, seekerChase:115, visionRange:165, visionSpread:0.55 };
+    this.state = 'patrol';
+    this.path = [];
+    this.pathTimer = 0;
+    this.target = null;
+    this.lastSeen = null;
+    this.searchTimer = 0;
+    this.stuckTimer = 0;
+    this.lastPos = null;
+    this.waypoints = [];
+    this.wpIndex = 0;
+  }
+
+  buildWaypoints(grid, cols, rows, cs) {
+    // Grid'i bölgelere ayır, her bölgeden 1 nokta al
+    const step = 4;
+    for (let r = 2; r < rows-2; r += step) {
+      for (let c = 2; c < cols-2; c += step) {
+        if (grid[r][c] !== WALL) this.waypoints.push({ col: c, row: r });
+      }
+    }
+    // Karıştır — tek yönlü devriye olmasın
+    for (let i = this.waypoints.length-1; i>0; i--) {
+      const j = Math.floor(Math.random()*(i+1));
+      [this.waypoints[i], this.waypoints[j]] = [this.waypoints[j], this.waypoints[i]];
+    }
+  }
+
+  update(dt, grid, cs, hiders) {
+    const e = this.e;
+
+    // Stuck detection — her 2 saniyede pozisyon kontrol
+    this.stuckTimer += dt;
+    if (this.stuckTimer > 2.0) {
+      const lp = this.lastPos;
+      if (lp && Math.hypot(e.x-lp.x, e.y-lp.y) < 8) {
+        // Sıkışmış — yeni path al
+        this.path = [];
+        this.wpIndex = (this.wpIndex + 1) % Math.max(1, this.waypoints.length);
+      }
+      this.lastPos = { x: e.x, y: e.y };
+      this.stuckTimer = 0;
+    }
+
+    // Vision
+    const detected = this.castVision(grid, cs, hiders);
+    if (detected) {
+      this.state = 'chase'; this.target = detected;
+      this.lastSeen = { x: detected.x, y: detected.y };
+      this.searchTimer = 4.0; this.path = [];
+    } else if (this.state === 'chase') {
+      this.state = 'search';
+    }
+    if (this.state === 'search') {
+      this.searchTimer -= dt;
+      if (this.searchTimer <= 0) { this.state = 'patrol'; this.target = null; }
+    }
+
+    // Path update
+    this.pathTimer -= dt;
+    const sc = Math.floor(e.x/cs), sr = Math.floor(e.y/cs);
+
+    if (this.path.length === 0 || this.pathTimer <= 0) {
+      this.pathTimer = 0.6;
+      let gc, gr;
+      if ((this.state==='chase'||this.state==='search') && (this.target||this.lastSeen)) {
+        const t = this.target || this.lastSeen;
+        gc = Math.floor(t.x/cs); gr = Math.floor(t.y/cs);
+      } else {
+        if (!this.waypoints.length) return;
+        const wp = this.waypoints[this.wpIndex % this.waypoints.length];
+        gc = wp.col; gr = wp.row;
+        // Hedefe yaklaştıysa sonraki waypoint
+        if (Math.hypot(e.x - gc*cs - cs/2, e.y - gr*cs - cs/2) < cs * 1.5) {
+          this.wpIndex = (this.wpIndex + 1) % this.waypoints.length;
+        }
+      }
+      const newPath = this.pf.bfs(sc, sr, gc, gr);
+      if (newPath && newPath.length > 0) this.path = newPath;
+    }
+
+    // Move along path
+    const speed = this.state === 'chase' ? this.diff.seekerChase : this.diff.seekerSpeed;
+    if (this.path.length > 0) {
+      const next = this.path[0];
+      const tx = next.col * cs + cs/2, ty = next.row * cs + cs/2;
+      const dx = tx - e.x, dy = ty - e.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 6) {
+        this.path.shift();
+      } else {
+        const nx = dx/dist, ny = dy/dist;
+        e.x += nx * speed * dt;
+        e.y += ny * speed * dt;
+        e.angle = Math.atan2(dy, dx);
+      }
+    }
+  }
+
+  castVision(grid, cs, hiders) {
+    const e = this.e;
+    const range = this.diff.visionRange;
+    const spread = Math.PI * this.diff.visionSpread;
+    for (const h of hiders) {
+      if (h.caught) continue;
+      const dx=h.x-e.x, dy=h.y-e.y;
+      if (Math.hypot(dx,dy) > range) continue;
+      let a = Math.atan2(dy,dx) - e.angle;
+      while(a>Math.PI) a-=Math.PI*2; while(a<-Math.PI) a+=Math.PI*2;
+      if (Math.abs(a) > spread/2) continue;
+      if (!this.rayBlocked(e.x,e.y,h.x,h.y,grid,cs)) return h;
+    }
+    return null;
+  }
+
+  rayBlocked(x0,y0,x1,y1,grid,cs) {
+    for(let i=1;i<28;i++){
+      const t=i/28, rx=x0+(x1-x0)*t, ry=y0+(y1-y0)*t;
+      const c=Math.floor(rx/cs), r=Math.floor(ry/cs);
+      if(r<0||c<0||r>=grid.length||c>=grid[0].length) return true;
+      if(grid[r][c]===WALL) return true;
+    }
+    return false;
+  }
+
+  getCone() { return { x:this.e.x, y:this.e.y, angle:this.e.angle, spread:Math.PI*this.diff.visionSpread, range:this.diff.visionRange }; }
+}
+
+// ═══════════════════════════════════════════════════════
+// HIDER AI — BFS kaçış + wander
+// ═══════════════════════════════════════════════════════
+class HiderAI {
+  constructor(entity, pf) {
+    this.e = entity; this.pf = pf;
+    this.state = 'wander';
+    this.path = []; this.pathTimer = 0;
+    this.fleeTimer = 0;
+    this.stuckTimer = 0; this.lastPos = null;
+  }
+
+  update(dt, grid, cs, seekers) {
+    const e = this.e;
+    if (e.caught) return;
+
+    // Stuck detection
+    this.stuckTimer += dt;
+    if (this.stuckTimer > 2.5) {
+      const lp = this.lastPos;
+      if (lp && Math.hypot(e.x-lp.x, e.y-lp.y) < 6) this.path = [];
+      this.lastPos = { x: e.x, y: e.y };
+      this.stuckTimer = 0;
+    }
+
+    const nearest = seekers.reduce((best, s) => {
+      const d = Math.hypot(s.x-e.x, s.y-e.y);
+      return (!best || d < best.d) ? { s, d } : best;
+    }, null);
+
+    const FLEE_DIST = 210;
+    if (nearest && nearest.d < FLEE_DIST) {
+      this.state = 'flee'; this.fleeTimer = 2.5; this.path = [];
+    } else if (this.fleeTimer > 0) {
+      this.fleeTimer -= dt;
+      if (this.fleeTimer <= 0) { this.state = 'wander'; this.path = []; }
+    } else {
+      this.state = 'wander';
+    }
+
+    this.pathTimer -= dt;
+    const sc = Math.floor(e.x/cs), sr = Math.floor(e.y/cs);
+
+    if (this.path.length === 0 || this.pathTimer <= 0) {
+      this.pathTimer = 0.7;
+      let gc, gr;
+
+      if (this.state === 'flee' && nearest) {
+        // Kaç: seeker'ın tersine git
+        const sdx = e.x - nearest.s.x, sdy = e.y - nearest.s.y;
+        const sd = Math.hypot(sdx, sdy) || 1;
+        const fx = e.x + (sdx/sd) * cs * 6, fy = e.y + (sdy/sd) * cs * 6;
+        gc = Math.max(1, Math.min(this.pf.cols-2, Math.floor(fx/cs)));
+        gr = Math.max(1, Math.min(this.pf.rows-2, Math.floor(fy/cs)));
+        // Duvarsa komşu ara
+        if (grid[gr][gc] === WALL) { gc = sc; gr = sr; }
+      } else {
+        // Wander — rastgele zemin hücresi
+        const floors = [];
+        for (let r=1; r<this.pf.rows-1; r++) for (let c=1; c<this.pf.cols-1; c++)
+          if (grid[r][c]!==WALL) floors.push({col:c,row:r});
+        const pick = floors[Math.floor(Math.random()*floors.length)];
+        gc = pick.col; gr = pick.row;
+      }
+
+      const newPath = this.pf.bfs(sc, sr, gc, gr);
+      if (newPath && newPath.length > 0) this.path = newPath;
+    }
+
+    const speed = this.state === 'flee' ? 112 : 55;
+    if (this.path.length > 0) {
+      const next = this.path[0];
+      const tx = next.col*cs+cs/2, ty = next.row*cs+cs/2;
+      const dx = tx-e.x, dy = ty-e.y, dist = Math.hypot(dx,dy);
+      if (dist < 6) { this.path.shift(); }
+      else {
+        e.x += (dx/dist)*speed*dt;
+        e.y += (dy/dist)*speed*dt;
+        e.angle = Math.atan2(dy, dx);
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// ENTITY
+// ═══════════════════════════════════════════════════════
+class Entity {
+  constructor(x,y,r,color,name){
+    this.x=x;this.y=y;this.radius=r;this.color=color;this.name=name;
+    this.angle=0;this.caught=false;this.isPlayer=false;this.ai=null;this.role=null;
+    this.trail=[];this.trailT=0;
+  }
+  tick(dt){
+    this.trailT-=dt;
+    if(this.trailT<=0){this.trail.push({x:this.x,y:this.y,age:0});if(this.trail.length>7)this.trail.shift();this.trailT=0.06;}
+    this.trail.forEach(t=>t.age+=dt);
+    this.trail=this.trail.filter(t=>t.age<0.35);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// ENGINE
+// ═══════════════════════════════════════════════════════
+class Engine {
+  constructor(mapIdx, diff) {
+    const md = MAPS[mapIdx % MAPS.length];
+    // Hücre boyutunu ekrana sığdır — küçük boyutu al
+    const screenW = document.documentElement.clientWidth;
+    const screenH = document.documentElement.clientHeight;
+    const cs = Math.floor(Math.min(screenW / md.cols, screenH / md.rows));
+    this.md=md; this.grid=md.grid; this.cs=cs; this.cols=md.cols; this.rows=md.rows;
+    this.entities=[];this.player=null;this.seekers=[];this.hiders=[];
+    this.mode=MODE.MENU; this.role=ROLE.H;
+    this.timeLeft=60; this.score=0; this.caughtCount=0;
+    this.spawnProt=3.0; this.keys={}; this.result=null;
+    this.jx=0; this.jy=0;
+    this.mapIdx=mapIdx;
+    this.diff = diff || Save.difficulty(1);
+    this._parse();
+    this.pf = new Pathfinder(this.grid, this.cols, this.rows);
+  }
+
+  _parse(){
+    this.hSpawns=[];this.sSpawns=[];this.coins=[];
+    for(let r=0;r<this.rows;r++) for(let c=0;c<this.cols;c++){
+      const v=this.grid[r][c], cx=c*this.cs+this.cs/2, cy=r*this.cs+this.cs/2;
+      if(v===HSPAWN) this.hSpawns.push({x:cx,y:cy});
+      if(v===SSPAWN) this.sSpawns.push({x:cx,y:cy});
+      if(v===COIN)   this.coins.push({x:cx,y:cy,got:false});
+    }
+  }
+
+  start(role){
+    const d = this.diff;
+    this.role=role; this.entities=[];this.seekers=[];this.hiders=[];
+    this.timeLeft=role===ROLE.H ? d.timeHider : d.timeSeeker;
+    this.score=0; this.caughtCount=0;
+    this.spawnProt=3.0; this.mode=MODE.PLAYING; this.result=null;
+    this.coins.forEach(c=>c.got=false);
+
+    const hC=['#ff6b9d','#7ecfff','#aaee88','#ffcc55','#cc88ff'];
+    const hN=['Bunny','Spittle','Hoppy','Abby','Sluggy'];
+    const sNames=['Watcher','Phantom','Stalker','Shade'];
+
+    if(role===ROLE.H){
+      const sp=this.hSpawns[0]||{x:this.cs*3,y:this.cs*3};
+      this.player=new Entity(sp.x,sp.y,14,'#ffffff','SEN');
+      this.player.isPlayer=true; this.player.role=ROLE.H;
+      this.hiders.push(this.player); this.entities.push(this.player);
+
+      // AI hiders
+      const hCount = Math.min(d.hiderCount - 1, this.hSpawns.length - 1);
+      for(let i=1;i<=hCount;i++){
+        const h=new Entity(this.hSpawns[i%this.hSpawns.length].x,this.hSpawns[i%this.hSpawns.length].y,13,hC[i%5],hN[i%5]);
+        h.role=ROLE.H; h.ai=new HiderAI(h,this.pf);
+        this.hiders.push(h); this.entities.push(h);
+      }
+
+      // AI seekers — difficulty'e göre sayı
+      const sCount = Math.min(d.seekerCount, this.sSpawns.length);
+      for(let i=0;i<sCount;i++){
+        const sp2=this.sSpawns[i%this.sSpawns.length];
+        const seeker=new Entity(sp2.x,sp2.y,15,'#ff3333',sNames[i%4]);
+        seeker.role=ROLE.S; seeker.angle=Math.PI;
+        seeker.ai=new SeekerAI(seeker,this.pf,d);
+        seeker.ai.buildWaypoints(this.grid,this.cols,this.rows,this.cs);
+        this.seekers.push(seeker); this.entities.push(seeker);
+      }
+
+    } else {
+      const ss=this.sSpawns[0]||{x:this.cs*2,y:this.cs*2};
+      this.player=new Entity(ss.x,ss.y,15,'#ff3333','SEN');
+      this.player.isPlayer=true; this.player.role=ROLE.S; this.player.angle=Math.PI;
+      this.seekers.push(this.player); this.entities.push(this.player);
+
+      const hCount = Math.min(d.hiderCount, this.hSpawns.length);
+      for(let i=0;i<hCount;i++){
+        const sp2=this.hSpawns[i];
+        const h=new Entity(sp2.x,sp2.y,13,hC[i%5],hN[i%5]);
+        h.role=ROLE.H; h.ai=new HiderAI(h,this.pf);
+        this.hiders.push(h); this.entities.push(h);
+      }
+    }
+  }
+
+  update(dt){
+    if(this.mode!==MODE.PLAYING) return;
+    this.timeLeft -= dt;
+    if(this.spawnProt>0) this.spawnProt-=dt;
+    if(this.player&&!this.player.caught) this._input(dt);
+    for(const e of this.entities){
+      e.tick(dt);
+      if(e.ai){
+        if(e.role===ROLE.S) e.ai.update(dt,this.grid,this.cs,this.hiders);
+        else e.ai.update(dt,this.grid,this.cs,this.seekers);
+      }
+    }
+    this._catches(); this._coins(); this._end();
+  }
+
+  _input(dt){
+    const p=this.player, k=this.keys, spd=132;
+    let dx=this.jx||0, dy=this.jy||0;
+    if(k['ArrowLeft']||k['a']||k['A']) dx-=1;
+    if(k['ArrowRight']||k['d']||k['D']) dx+=1;
+    if(k['ArrowUp']||k['w']||k['W']) dy-=1;
+    if(k['ArrowDown']||k['s']||k['S']) dy+=1;
+    if(!dx&&!dy) return;
+    const m=Math.hypot(dx,dy)||1;
+    p.angle=Math.atan2(dy,dx);
+    const nx=p.x+(dx/m)*spd*dt, ny=p.y+(dy/m)*spd*dt;
+    if(!this._wall(nx,p.y,p.radius)) p.x=nx;
+    if(!this._wall(p.x,ny,p.radius)) p.y=ny;
+  }
+
+  _wall(x,y,r){
+    for(const [ox,oy] of [[-1,-1],[1,-1],[-1,1],[1,1]]){
+      const c=Math.floor((x+ox*r)/this.cs), row=Math.floor((y+oy*r)/this.cs);
+      if(row<0||c<0||row>=this.rows||c>=this.cols) return true;
+      if(this.grid[row][c]===WALL) return true;
+    }
+    return false;
+  }
+
+  _catches(){
+    if(this.spawnProt>0) return;
+    for(const s of this.seekers) for(const h of this.hiders){
+      if(h.caught) continue;
+      if(Math.hypot(s.x-h.x,s.y-h.y)<s.radius+h.radius+4){
+        h.caught=true; this.caughtCount++;
+        if(h.isPlayer){this.mode=MODE.OVER;this.result='caught';if(this.onCaught)this.onCaught('player');}
+        else{this.score+=500;if(this.onCaught)this.onCaught('hider');}
+      }
+    }
+  }
+
+  _coins(){
+    if(!this.player||this.player.caught) return;
+    for(const c of this.coins){
+      if(c.got) continue;
+      if(Math.hypot(this.player.x-c.x,this.player.y-c.y)<this.player.radius+14){
+        c.got=true; this.score+=50; if(this.onCoin)this.onCoin();
+      }
+    }
+  }
+
+  _end(){
+    if(this.mode!==MODE.PLAYING) return;
+    if(this.timeLeft<=0){
+      this.mode=this.role===ROLE.H?MODE.WIN:MODE.OVER;
+      this.result=this.role===ROLE.H?'survived':'timeout';
+      if(this.role===ROLE.H&&this.onWin) this.onWin();
+      else if(this.onTimeout) this.onTimeout();
+      return;
+    }
+    if(this.role===ROLE.S&&this.hiders.filter(h=>!h.caught).length===0){
+      this.mode=MODE.WIN; this.result='allcaught'; if(this.onWin)this.onWin();
+    }
+  }
+
+  getCone(){
+    if(!this.player||this.role!==ROLE.S) return null;
+    return{x:this.player.x,y:this.player.y,angle:this.player.angle,spread:Math.PI*0.65,range:200};
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// RENDERER
+// ═══════════════════════════════════════════════════════
+class Renderer {
+  constructor(cv){this.cv=cv;this.ctx=cv.getContext('2d');this.cam={x:0,y:0};}
+  resize(w,h){this.cv.width=w;this.cv.height=h;}
+  updateCam(eng){
+    if(!eng.player) return;
+    const p=eng.player,W=this.cv.width,H=this.cv.height;
+    const mw=eng.cols*eng.cs, mh=eng.rows*eng.cs;
+    this.cam.x=Math.max(0,Math.min(mw-W,p.x-W/2));
+    this.cam.y=Math.max(0,Math.min(mh-H,p.y-H/2));
+  }
+  render(eng,dt){
+    const ctx=this.ctx,W=this.cv.width,H=this.cv.height;
+    ctx.save(); ctx.translate(-this.cam.x,-this.cam.y);
+    ctx.fillStyle='#131d13'; ctx.fillRect(this.cam.x,this.cam.y,W,H);
+    this._map(eng); this._coins(eng); this._cones(eng); this._entities(eng);
+    ctx.restore();
+  }
+
+  _map(eng){
+    const ctx=this.ctx,cs=eng.cs,cam=this.cam,W=this.cv.width,H=this.cv.height;
+    const c0=Math.floor(cam.x/cs),c1=Math.min(eng.cols,Math.ceil((cam.x+W)/cs)+1);
+    const r0=Math.floor(cam.y/cs),r1=Math.min(eng.rows,Math.ceil((cam.y+H)/cs)+1);
+    for(let r=r0;r<r1;r++) for(let c=c0;c<c1;c++){
+      const cell=eng.grid[r][c],px=c*cs,py=r*cs;
+      if(cell===WALL){
+        ctx.fillStyle='#3a4f6a'; ctx.fillRect(px,py,cs,cs);
+        ctx.fillStyle='#4d6a8a'; ctx.fillRect(px,py,cs,3);
+        ctx.fillStyle='#1a2d40'; ctx.fillRect(px,py+cs-3,cs,3);
+        ctx.fillStyle='#2a3d52'; ctx.fillRect(px+cs-3,py+3,3,cs-3);
+      } else {
+        ctx.fillStyle=((r+c)%2===0)?'#1a2e1a':'#162614';
+        ctx.fillRect(px,py,cs,cs);
+      }
+    }
+  }
+
+  _coins(eng){
+    const ctx=this.ctx;
+    for(const coin of eng.coins){
+      if(coin.got) continue;
+      const g=ctx.createRadialGradient(coin.x,coin.y,2,coin.x,coin.y,14);
+      g.addColorStop(0,'rgba(255,220,50,0.45)'); g.addColorStop(1,'rgba(255,180,0,0)');
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(coin.x,coin.y,14,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#ffd700'; ctx.beginPath(); ctx.arc(coin.x,coin.y,8,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#ffec6e'; ctx.beginPath(); ctx.arc(coin.x-2,coin.y-2,3,0,Math.PI*2); ctx.fill();
+    }
+  }
+
+  _cones(eng){
+    const ctx=this.ctx;
+    const draw=(cone,col)=>{
+      if(!cone) return;
+      ctx.save(); ctx.globalAlpha=0.17; ctx.fillStyle=col;
+      ctx.beginPath(); ctx.moveTo(cone.x,cone.y);
+      for(let i=0;i<=22;i++){
+        const a=cone.angle-cone.spread/2+(cone.spread*i/22);
+        ctx.lineTo(cone.x+Math.cos(a)*cone.range,cone.y+Math.sin(a)*cone.range);
+      }
+      ctx.closePath(); ctx.fill(); ctx.restore();
+    };
+    if(eng.role===ROLE.S&&eng.player) draw(eng.getCone(),'#ff4422');
+    for(const s of eng.seekers){ if(!s.isPlayer&&s.ai) draw(s.ai.getCone(),'#ff6633'); }
+  }
+
+  _entities(eng){
+    const ctx=this.ctx;
+    for(const e of eng.entities){
+      if(e.caught){ this._caught(e); continue; }
+      // Trail
+      for(const t of e.trail){
+        ctx.globalAlpha=(1-t.age/0.35)*0.22; ctx.fillStyle=e.color;
+        ctx.beginPath(); ctx.arc(t.x,t.y,e.radius*0.4,0,Math.PI*2); ctx.fill();
+      }
+      ctx.globalAlpha=1;
+      // Shadow
+      ctx.fillStyle='rgba(0,0,0,0.2)';
+      ctx.beginPath(); ctx.ellipse(e.x+2,e.y+4,e.radius*0.9,e.radius*0.5,0,0,Math.PI*2); ctx.fill();
+      // Glow
+      if(e.isPlayer){
+        const g=ctx.createRadialGradient(e.x,e.y,e.radius*0.5,e.x,e.y,e.radius*1.8);
+        g.addColorStop(0,e.role===ROLE.S?'rgba(255,50,50,0.28)':'rgba(100,200,255,0.28)');
+        g.addColorStop(1,'rgba(0,0,0,0)');
+        ctx.fillStyle=g; ctx.beginPath(); ctx.arc(e.x,e.y,e.radius*1.8,0,Math.PI*2); ctx.fill();
+      }
+      if(e.role===ROLE.S) this._drawSeeker(e);
+      else this._drawHider(e);
+      ctx.fillStyle=e.isPlayer?'#fff':'rgba(255,255,255,0.65)';
+      ctx.font=`${e.isPlayer?'bold ':''}10px monospace`;
+      ctx.textAlign='center'; ctx.fillText(e.name,e.x,e.y-e.radius-4);
+    }
+    ctx.textAlign='left';
+  }
+
+  _drawSeeker(e){
+    const ctx=this.ctx,r=e.radius;
+    ctx.fillStyle=e.isPlayer?'#ff2222':'#cc1111';
+    ctx.beginPath(); ctx.arc(e.x,e.y,r,0,Math.PI*2); ctx.fill();
+    const ex=e.x+Math.cos(e.angle)*r*0.4, ey=e.y+Math.sin(e.angle)*r*0.4;
+    ctx.fillStyle='#000'; ctx.beginPath(); ctx.arc(ex,ey,r*0.28,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ff6666'; ctx.beginPath(); ctx.arc(ex-1,ey-1,r*0.1,0,Math.PI*2); ctx.fill();
+  }
+
+  _drawHider(e){
+    const ctx=this.ctx,r=e.radius;
+    ctx.fillStyle=e.color; ctx.beginPath(); ctx.arc(e.x,e.y,r,0,Math.PI*2); ctx.fill();
+    const a1=e.angle-Math.PI*0.35, a2=e.angle+Math.PI*0.35;
+    ctx.fillStyle=e.color;
+    ctx.beginPath(); ctx.ellipse(e.x+Math.cos(a1)*r*0.8,e.y+Math.sin(a1)*r*0.8,r*0.25,r*0.5,a1,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(e.x+Math.cos(a2)*r*0.8,e.y+Math.sin(a2)*r*0.8,r*0.25,r*0.5,a2,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#222';
+    const eL={x:e.x+Math.cos(e.angle-0.4)*r*0.45,y:e.y+Math.sin(e.angle-0.4)*r*0.45};
+    const eR={x:e.x+Math.cos(e.angle+0.4)*r*0.45,y:e.y+Math.sin(e.angle+0.4)*r*0.45};
+    ctx.beginPath(); ctx.arc(eL.x,eL.y,r*0.15,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(eR.x,eR.y,r*0.15,0,Math.PI*2); ctx.fill();
+  }
+
+  _caught(e){
+    const ctx=this.ctx;
+    ctx.globalAlpha=0.25; ctx.fillStyle=e.color;
+    ctx.beginPath(); ctx.arc(e.x,e.y,e.radius,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1; ctx.strokeStyle='#ff4444'; ctx.lineWidth=2.5;
+    ctx.beginPath();
+    ctx.moveTo(e.x-7,e.y-7); ctx.lineTo(e.x+7,e.y+7);
+    ctx.moveTo(e.x+7,e.y-7); ctx.lineTo(e.x-7,e.y+7);
+    ctx.stroke();
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// UI RENDERER
+// ═══════════════════════════════════════════════════════
+class UI {
+  constructor(cv){this.cv=cv;this.ctx=cv.getContext('2d');}
+
+  render(eng, saveData){
+    const m=eng.mode;
+    if(m===MODE.MENU) this._menu(eng, saveData);
+    else if(m===MODE.PLAYING||m===MODE.PAUSED) this._hud(eng);
+    if(m===MODE.PAUSED) this._pause(eng);
+    if(m===MODE.OVER) this._over(eng, saveData);
+    if(m===MODE.WIN) this._win(eng, saveData);
+  }
+
+  _rr(ctx,x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+    ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+    ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+    ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+  }
+
+  _menu(eng, sd){
+    const ctx=this.ctx,W=this.cv.width,H=this.cv.height;
+    ctx.fillStyle='rgba(8,14,8,0.94)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+
+    // Logo
+    ctx.fillStyle='#ffd700'; ctx.font='bold 44px "Trebuchet MS",sans-serif';
+    ctx.fillText('HIDE & SEEK',W/2,H*0.18);
+    ctx.fillStyle='rgba(255,215,0,0.35)'; ctx.font='13px monospace';
+    ctx.fillText('BOGONG AI GAMES',W/2,H*0.24);
+
+    // Level & toplam skor
+    ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font='13px monospace';
+    ctx.fillText(`⭐ Seviye ${sd.level}   |   🏆 ${sd.totalScore} puan   |   🎮 ${sd.plays} oyun`,W/2,H*0.31);
+
+    // Mod kartları
+    const cx1=W/2-83, cx2=W/2+83, cy=H*0.44, cw=150, ch=118;
+
+    ctx.fillStyle='rgba(80,180,255,0.08)'; this._rr(ctx,cx1-cw/2,cy,cw,ch,12); ctx.fill();
+    ctx.strokeStyle='rgba(80,180,255,0.28)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#7ecfff'; ctx.font='36px sans-serif'; ctx.fillText('🐰',cx1,cy+52);
+    ctx.fillStyle='#fff'; ctx.font='bold 16px sans-serif'; ctx.fillText('SAKLAN',cx1,cy+80);
+    ctx.fillStyle='rgba(255,255,255,0.4)'; ctx.font='11px sans-serif'; ctx.fillText('60 sn kaç!',cx1,cy+100);
+
+    ctx.fillStyle='rgba(255,80,80,0.08)'; this._rr(ctx,cx2-cw/2,cy,cw,ch,12); ctx.fill();
+    ctx.strokeStyle='rgba(255,80,80,0.28)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#ff6b6b'; ctx.font='36px sans-serif'; ctx.fillText('🔴',cx2,cy+52);
+    ctx.fillStyle='#fff'; ctx.font='bold 16px sans-serif'; ctx.fillText('ARA',cx2,cy+80);
+    ctx.fillStyle='rgba(255,255,255,0.4)'; ctx.font='11px sans-serif'; ctx.fillText('Hepsini bul!',cx2,cy+100);
+
+    // Harita & zorluk bilgisi
+    const mapName = MAPS[Save.mapForLevel(sd.level) % MAPS.length].name;
+    const diffLabel = Save.difficulty(sd.level).label;
+    ctx.fillStyle='rgba(255,255,255,0.35)'; ctx.font='13px monospace';
+    ctx.fillText(`🗺 ${mapName}  ·  ${diffLabel}`,W/2,H*0.73);
+    ctx.fillStyle='rgba(255,255,255,0.2)'; ctx.font='11px monospace';
+    ctx.fillText('WASD / Yön tuşları · Joystick',W/2,H*0.78);
+    ctx.textAlign='left';
+  }
+
+  _hud(eng){
+    const ctx=this.ctx,W=this.cv.width;
+    // Top bar
+    ctx.fillStyle='rgba(8,14,8,0.8)'; this._rr(ctx,10,10,W-20,54,10); ctx.fill();
+    const t=Math.max(0,eng.timeLeft);
+    const mm=Math.floor(t/60), ss=Math.floor(t%60).toString().padStart(2,'0');
+    ctx.fillStyle=t<10?'#ff4444':'#ffffff'; ctx.font='bold 26px monospace'; ctx.textAlign='center';
+    ctx.fillText(`${mm}:${ss}`,W/2,44);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 16px monospace'; ctx.textAlign='right';
+    ctx.fillText(`⬤ ${eng.score}`,W-18,44);
+    ctx.fillStyle=eng.role===ROLE.S?'#ff5555':'#55ccff';
+    ctx.font='bold 12px sans-serif'; ctx.textAlign='left';
+    ctx.fillText(eng.role===ROLE.S?'🔴 ARIYORSUN':'🐰 SAKLANIYORSUN',18,44);
+
+    // Hider dots
+    if(eng.role===ROLE.S){
+      const total=eng.hiders.length, caught=eng.hiders.filter(h=>h.caught).length;
+      ctx.textAlign='center'; ctx.font='14px sans-serif';
+      let d=''; for(let i=0;i<total;i++) d+=(i<caught)?'✕ ':'● ';
+      ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.fillText(d.trim(),W/2,70);
+    }
+
+    // Spawn protection
+    if(eng.spawnProt>0){
+      ctx.fillStyle='rgba(255,220,50,0.9)'; ctx.font='bold 18px monospace'; ctx.textAlign='center';
+      ctx.fillText(`🛡 ${Math.ceil(eng.spawnProt)}`,W/2,H*0.88||600);
+    }
+    ctx.textAlign='left';
+  }
+
+  _pause(eng){
+    const ctx=this.ctx,W=this.cv.width,H=this.cv.height;
+    ctx.fillStyle='rgba(0,0,0,0.65)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#ffd700'; ctx.font='bold 34px sans-serif'; ctx.fillText('⏸ DURAKLADI',W/2,H*0.38);
+    // Devam butonu
+    ctx.fillStyle='rgba(80,200,80,0.15)'; this._rr(ctx,W/2-90,H*0.47,180,52,12); ctx.fill();
+    ctx.strokeStyle='rgba(80,200,80,0.5)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#88ff88'; ctx.font='bold 18px sans-serif'; ctx.fillText('▶  Devam',W/2,H*0.47+33);
+    // Çık butonu
+    ctx.fillStyle='rgba(200,60,60,0.15)'; this._rr(ctx,W/2-90,H*0.59,180,52,12); ctx.fill();
+    ctx.strokeStyle='rgba(200,60,60,0.5)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#ff8888'; ctx.font='bold 18px sans-serif'; ctx.fillText('✕  Ana Menü',W/2,H*0.59+33);
+    ctx.textAlign='left';
+  }
+
+  _over(eng, sd){
+    const ctx=this.ctx,W=this.cv.width,H=this.cv.height;
+    ctx.fillStyle='rgba(28,0,0,0.92)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#ff4444'; ctx.font='bold 38px "Trebuchet MS",sans-serif';
+    ctx.fillText(eng.result==='timeout'?'SÜRE BİTTİ!':'YAKALANDIN!',W/2,H*0.28);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 22px monospace';
+    ctx.fillText(`Bu oyun: ${eng.score} puan`,W/2,H*0.42);
+    ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font='15px monospace';
+    ctx.fillText(`Toplam: ${sd.totalScore} puan  |  Seviye ${sd.level}`,W/2,H*0.51);
+    // Tekrar
+    ctx.fillStyle='rgba(255,200,0,0.12)'; this._rr(ctx,W/2-90,H*0.60,180,50,12); ctx.fill();
+    ctx.strokeStyle='rgba(255,200,0,0.4)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#ffd700'; ctx.font='bold 17px sans-serif'; ctx.fillText('🔄 Tekrar',W/2,H*0.60+32);
+    // Menü
+    ctx.fillStyle='rgba(120,120,120,0.12)'; this._rr(ctx,W/2-90,H*0.73,180,50,12); ctx.fill();
+    ctx.strokeStyle='rgba(120,120,120,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#aaaaaa'; ctx.font='bold 17px sans-serif'; ctx.fillText('🏠 Ana Menü',W/2,H*0.73+32);
+    ctx.textAlign='left';
+  }
+
+  _win(eng, sd){
+    const ctx=this.ctx,W=this.cv.width,H=this.cv.height;
+    ctx.fillStyle='rgba(0,18,0,0.92)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle='#55ff88'; ctx.font='bold 36px "Trebuchet MS",sans-serif';
+    ctx.fillText(eng.result==='survived'?'KURTULDUN! 🎉':'HEPSİNİ BULDUN! 🏆',W/2,H*0.26);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 22px monospace';
+    ctx.fillText(`Bu oyun: ${eng.score} puan`,W/2,H*0.40);
+    ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.font='15px monospace';
+    ctx.fillText(`Toplam: ${sd.totalScore} puan  |  Seviye ${sd.level}`,W/2,H*0.49);
+    const prevLevel = sd.level - (sd.wins % 2 === 0 ? 1 : 0);
+    if(sd.level > prevLevel || sd.wins % 2 === 0){
+      const nextMap = MAPS[Save.mapForLevel(sd.level) % MAPS.length].name;
+      const nextDiff = Save.difficulty(sd.level).label;
+      ctx.fillStyle='#ffdd44'; ctx.font='bold 14px sans-serif';
+      ctx.fillText(`⭐ Seviye ${sd.level}!  →  ${nextMap}  ·  ${nextDiff}`,W/2,H*0.56);
+    }
+    ctx.fillStyle='rgba(255,200,0,0.12)'; this._rr(ctx,W/2-90,H*0.62,180,50,12); ctx.fill();
+    ctx.strokeStyle='rgba(255,200,0,0.4)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#ffd700'; ctx.font='bold 17px sans-serif'; ctx.fillText('🔄 Tekrar',W/2,H*0.62+32);
+    ctx.fillStyle='rgba(120,120,120,0.12)'; this._rr(ctx,W/2-90,H*0.75,180,50,12); ctx.fill();
+    ctx.strokeStyle='rgba(120,120,120,0.35)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#aaaaaa'; ctx.font='bold 17px sans-serif'; ctx.fillText('🏠 Ana Menü',W/2,H*0.75+32);
+    ctx.textAlign='left';
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// SOUND
+// ═══════════════════════════════════════════════════════
+const Sound = (() => {
+  let ac=null;
+  const init=()=>{ if(!ac) ac=new(window.AudioContext||window.webkitAudioContext)(); };
+  const tone=(f,type,dur,vol,t0,f2)=>{
+    const o=ac.createOscillator(),g=ac.createGain();
+    o.connect(g);g.connect(ac.destination);
+    o.type=type; o.frequency.setValueAtTime(f,t0);
+    if(f2) o.frequency.exponentialRampToValueAtTime(f2,t0+dur);
+    g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+    o.start(t0); o.stop(t0+dur);
+  };
+  const noise=(dur,t0)=>{
+    const buf=ac.createBuffer(1,ac.sampleRate*dur,ac.sampleRate);
+    const d=buf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*0.3;
+    const s=ac.createBufferSource(),g=ac.createGain();
+    s.buffer=buf;s.connect(g);g.connect(ac.destination);
+    g.gain.setValueAtTime(0.4,t0);g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+    s.start(t0);
+  };
+  return {
+    init,
+    coin(){ init(); const t=ac.currentTime; tone(880,'sine',0.08,0.3,t); tone(1320,'sine',0.12,0.25,t+0.06); },
+    caught(){ init(); const t=ac.currentTime; tone(440,'square',0.08,0.2,t); tone(554,'square',0.08,0.2,t+0.09); tone(659,'square',0.15,0.2,t+0.18); },
+    playerCaught(){ init(); const t=ac.currentTime; tone(660,'sawtooth',0.15,0.3,t,200); tone(660,'sawtooth',0.15,0.3,t+0.22,200); noise(0.3,t+0.1); },
+    win(){ init(); const t=ac.currentTime; [523,659,784,1047].forEach((f,i)=>tone(f,'sine',0.18,0.3,t+i*0.14)); },
+    timeout(){ init(); const t=ac.currentTime; [440,392,349,294].forEach((f,i)=>tone(f,'sine',0.22,0.25,t+i*0.18)); },
+  };
+})();
+
+// ═══════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════
+const wrap   = document.getElementById('wrap');
+const gc     = document.getElementById('gc');
+const uc     = document.getElementById('uc');
+const hudBtns= document.getElementById('hud-btns');
+const btnPause=document.getElementById('btn-pause');
+const btnQuit =document.getElementById('btn-quit');
+
+let W, H;
+function resize() {
+  // wrap'ın fixed inset:0 boyutunu al
+  const r = wrap.getBoundingClientRect();
+  W = Math.round(r.width)  || document.documentElement.clientWidth;
+  H = Math.round(r.height) || document.documentElement.clientHeight;
+  [gc, uc].forEach(c => {
+    c.width  = W;
+    c.height = H;
+    c.style.width  = W + 'px';
+    c.style.height = H + 'px';
+  });
+}
+// Safari adres çubuğu kaybolana kadar bekle
+setTimeout(resize, 0);
+setTimeout(resize, 300);
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 400));
+
+// Safari bounce/scroll engelle — sadece wrap içinde
+wrap.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+wrap.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
+
+let saveData = Save.get();
+let mapIdx   = Save.mapForLevel(saveData.level);
+let diff     = Save.difficulty(saveData.level);
+let eng      = new Engine(mapIdx, diff);
+let rend     = new Renderer(gc);
+let ui       = new UI(uc);
+
+function wireSound(e){
+  e.onCaught=(who)=>{ if(who==='player') Sound.playerCaught(); else Sound.caught(); };
+  e.onCoin=()=>Sound.coin();
+  e.onWin=()=>{ Sound.win(); saveData=Save.recordWin(e.score); };
+  e.onTimeout=()=>{ Sound.timeout(); saveData=Save.addScore(e.score); };
+}
+wireSound(eng);
+
+function newGame(role){
+  eng.start(role);
+  hudBtns.style.display='flex';
+}
+function goMenu(){
+  saveData = Save.get();
+  mapIdx   = Save.mapForLevel(saveData.level);
+  diff     = Save.difficulty(saveData.level);
+  eng  = new Engine(mapIdx, diff);
+  wireSound(eng);
+  rend = new Renderer(gc);
+  ui   = new UI(uc);
+  hudBtns.style.display='none';
+}
+
+// Klavye
+const keys={};
+window.addEventListener('keydown',e=>{
+  keys[e.key]=true;
+  if(e.key==='p'||e.key==='Escape'){
+    if(eng.mode===MODE.PLAYING) eng.mode=MODE.PAUSED;
+    else if(eng.mode===MODE.PAUSED) eng.mode=MODE.PLAYING;
+  }
+  if(e.key==='m') goMenu();
+});
+window.addEventListener('keyup',e=>keys[e.key]=false);
+
+// ── TAM EKRAN ───────────────────────────────────────────────
+function goFullscreen() {
+  const el = document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen();
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+}
+// İlk dokunuşta tam ekrana geç
+document.addEventListener('touchstart', goFullscreen, { once: true });
+document.addEventListener('click',      goFullscreen, { once: true });
+
+// ── JOYSTICK — sol yarı, document seviyesi ──────────────────
+const jbase  = document.getElementById('jbase');
+const jthumb = document.getElementById('jthumb');
+
+let jId = null;
+let jOx = 0, jOy = 0;
+const jR  = 65;
+const joy = { x: 0, y: 0 };
+
+function jShow(x, y) {
+  jbase.style.left   = x + 'px'; jbase.style.top   = y + 'px';
+  jthumb.style.left  = x + 'px'; jthumb.style.top  = y + 'px';
+  jbase.style.display = 'block'; jthumb.style.display = 'block';
+}
+function jHide() {
+  jbase.style.display = 'none'; jthumb.style.display = 'none';
+  joy.x = 0; joy.y = 0; jId = null;
+}
+function jUpdate(cx, cy) {
+  let dx = cx - jOx, dy = cy - jOy;
+  const d = Math.hypot(dx, dy);
+  if (d > jR) { dx = dx/d*jR; dy = dy/d*jR; }
+  jthumb.style.left = (jOx + dx) + 'px';
+  jthumb.style.top  = (jOy + dy) + 'px';
+  joy.x = dx / jR; joy.y = dy / jR;
+}
+
+// Sol yarı: joystick. Sağ yarı: butonlar/tap — karışmasın
+document.addEventListener('touchstart', e => {
+  if (eng.mode !== MODE.PLAYING) return;
+  if (jId !== null) return;
+  const rect = wrap.getBoundingClientRect();
+  for (const t of e.changedTouches) {
+    const lx = t.clientX - rect.left;
+    const ly = t.clientY - rect.top;
+    if (lx >= 0 && lx < rect.width * 0.58 && ly > rect.height * 0.25) {
+      e.preventDefault();
+      Sound.init();
+      jId = t.identifier; jOx = lx; jOy = ly;
+      jShow(lx, ly);
+      return; // sadece bir joystick
+    }
+  }
+}, { passive: false });
+
+document.addEventListener('touchmove', e => {
+  if (jId === null) return;
+  for (const t of e.changedTouches) {
+    if (t.identifier !== jId) continue;
+    const rect = wrap.getBoundingClientRect();
+    jUpdate(t.clientX - rect.left, t.clientY - rect.top);
+    // Sadece joystick touch'ını engelle, diğerlerini serbest bırak
+    e.preventDefault();
+    return;
+  }
+}, { passive: false });
+
+document.addEventListener('touchend', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === jId) { jHide(); return; }
+  }
+});
+document.addEventListener('touchcancel', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === jId) { jHide(); return; }
+  }
+});
+
+// ── SAĞ TARAF — UI tıklama/dokunma ──────────────────────────
+function handleTap(clientX, clientY) {
+  Sound.init();
+  const rect = uc.getBoundingClientRect();
+  const xr = (clientX - rect.left) / rect.width;
+  const yr = (clientY - rect.top)  / rect.height;
+
+  if (eng.mode === MODE.MENU) {
+    saveData = Save.get();
+    mapIdx   = Save.mapForLevel(saveData.level);
+    diff     = Save.difficulty(saveData.level);
+    eng = new Engine(mapIdx, diff); wireSound(eng);
+    rend = new Renderer(gc); ui = new UI(uc);
+    newGame(xr < 0.5 ? ROLE.H : ROLE.S);
+  }
+  else if (eng.mode === MODE.PAUSED) {
+    if (yr > 0.44 && yr < 0.57) eng.mode = MODE.PLAYING;
+    else if (yr > 0.56 && yr < 0.70) goMenu();
+  }
+  else if (eng.mode === MODE.OVER || eng.mode === MODE.WIN) {
+    if (yr > 0.58 && yr < 0.72) {
+      const r = eng.role;
+      eng = new Engine(mapIdx, diff); wireSound(eng);
+      rend = new Renderer(gc); ui = new UI(uc);
+      newGame(r);
+    } else if (yr > 0.71 && yr < 0.86) {
+      goMenu();
+    }
+  }
+}
+
+// Canvas: mouse click
+uc.addEventListener('click', e => handleTap(e.clientX, e.clientY));
+
+// Canvas: touch — joystick olmayan touch'lar için
+uc.addEventListener('touchend', e => {
+  for (const t of e.changedTouches) {
+    if (t.identifier === jId) continue; // joystick touch'ı yoksay
+    handleTap(t.clientX, t.clientY);
+    e.preventDefault();
+    return;
+  }
+}, { passive: false });
+
+// Pause/Quit butonları — touchstart ile (daha hızlı tepki)
+btnPause.addEventListener('touchstart', e => {
+  e.preventDefault(); e.stopPropagation(); Sound.init();
+  if (eng.mode === MODE.PLAYING)       eng.mode = MODE.PAUSED;
+  else if (eng.mode === MODE.PAUSED)   eng.mode = MODE.PLAYING;
+}, { passive: false });
+btnQuit.addEventListener('touchstart', e => {
+  e.preventDefault(); e.stopPropagation(); Sound.init();
+  goMenu();
+}, { passive: false });
+btnPause.addEventListener('click', () => {
+  if (eng.mode === MODE.PLAYING)     eng.mode = MODE.PAUSED;
+  else if (eng.mode === MODE.PAUSED) eng.mode = MODE.PLAYING;
+});
+btnQuit.addEventListener('click', () => goMenu());
+
+// Game loop
+let last=0;
+function loop(ts){
+  const dt=Math.min((ts-last)/1000,0.05); last=ts;
+  eng.jx=joy.x; eng.jy=joy.y;
+  eng.keys=keys;
+  eng.update(dt);
+  gc.getContext('2d').clearRect(0,0,W,H);
+  rend.resize(W,H); rend.updateCam(eng); rend.render(eng,dt);
+  uc.width=W; uc.height=H;
+  ui.cv=uc; ui.ctx=uc.getContext('2d');
+  ui.cv.getContext('2d').clearRect(0,0,W,H);
+  saveData=Save.get();
+  ui.render(eng, saveData);
+  // Pause butonu ikonunu güncelle
+  btnPause.textContent=eng.mode===MODE.PAUSED?'▶':'⏸';
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
